@@ -21,6 +21,11 @@ func (s *server) SaveMessage(ctx context.Context, req *logging.SaveMessageReques
     s.mu.Lock()
     defer s.mu.Unlock()
 
+    if _, exists := s.messages[req.Uuid]; exists {
+        fmt.Printf("LoggingService: UUID=%s is already exists \n", req.Uuid)
+        return &logging.SaveMessageResponse{Success: false}, nil
+    }
+
     s.messages[req.Uuid] = req.Msg
     fmt.Printf("LoggingService::SaveMessage UUID=%s, msg=%s\n", req.Uuid, req.Msg)
 
