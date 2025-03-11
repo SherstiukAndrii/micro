@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package logging;
+
+option go_package = "./logging;logging";
+
+service LoggingService {
+  rpc SaveMessage (SaveMessageRequest) returns (SaveMessageResponse);
+  rpc GetMessages (GetMessagesRequest) returns (GetMessagesResponse);
+}
+
+message SaveMessageRequest {
+  string uuid = 1;
+  string msg  = 2;
+}
+
+message SaveMessageResponse {
+  bool success = 1;
+}
+
+message GetMessagesRequest {}
+
+message GetMessagesResponse {
+  repeated string messages = 1;
+}
