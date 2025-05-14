@@ -30,9 +30,10 @@ func main() {
 		fmt.Fprintln(w, "not implemented yet")
 	})
 
-	fmt.Println("Messages-service started on 8081")
 	for _, addr := range addr {
-		fmt.Printf("Messages-service started on %s\n", addr)
-		log.Fatal(http.ListenAndServe(addr, nil))
+		// go func(addr string) {
+			fmt.Printf("Messages-service started on %s\n", addr)
+			log.Fatal(http.ListenAndServe(addr, nil))
+		// }(addr)
 	}
 }

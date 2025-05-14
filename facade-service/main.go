@@ -83,7 +83,8 @@ func (fs *FacadeService) getHandler(w http.ResponseWriter, r *http.Request) {
 	res, _ := logClient.GetMessages(context.Background(), &logging.GetMessagesRequest{})
 
 	message := fs.getMessageService()
-	resp, _ := http.Get(fmt.Sprintf("%s/message", message))
+	addr := fmt.Sprintf("http://%s/message", message)
+	resp, _ := http.Get(addr)
 	messageServiceText := ""
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -125,7 +126,7 @@ func sendMessageWithRetry(client logging.LoggingServiceClient, uuid string, msg 
 		resp, err := client.SaveMessage(ctx, &logging.SaveMessageRequest{Uuid: uuid, Msg: msg})
 		if err == nil {
 			if resp.Success {
-				log.Printf("[attempt %d] Success: uuid=%s", attempt, uuid)
+				log.Printf("[attempt %d] Success: uuid=%s Client=%v", attempt, uuid, client)
 			} else {
 				log.Printf("[attempt %d] Duplicate: uuid=%s", attempt, uuid)
 			}
@@ -157,6 +158,6 @@ func main() {
 	http.HandleFunc("/get", facadeService.getHandler)
 	http.HandleFunc("/post", facadeService.postHandler)
 
-	fmt.Println("Facade-service started on 8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	fmt.Println("Facade-service started on 8082")
+	log.Fatal(http.ListenAndServe(":8082", nil))
 }

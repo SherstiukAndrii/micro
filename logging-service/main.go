@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 
 	"github.com/hazelcast/hazelcast-go-client"
@@ -75,22 +76,30 @@ func (s *LoggingService) GetMessages(ctx context.Context, req *logging.GetMessag
 	return &logging.GetMessagesResponse{Messages: msgs}, nil
 }
 
-func StartNewServer(target string) {
+func StartNewServer(service string) {
+	host, port, _ := net.SplitHostPort(service)
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		panic(err)
+	}
+
+	// dirty hack to get gzcast port
+	p -= 3000
+	hzAddr := fmt.Sprintf("%s:%d", host, p)
 	config := hazelcast.Config{}
 	config.Cluster.Name = "micro"
-	config.Cluster.Network.SetAddresses(target)
+	config.Cluster.Network.SetAddresses(hzAddr)
 	s := NewLoggingService(config)
 
-	lis, _ := net.Listen("tcp", target)
+	grpcAddr := fmt.Sprintf(":%s", port)
+	lis, _ := net.Listen("tcp", grpcAddr)
 	grpcServer := grpc.NewServer()
 
 	logging.RegisterLoggingServiceServer(grpcServer, s)
-	fmt.Printf("Logging-service started on %v...", target)
-	go func() {
-		if err := grpcServer.Serve(lis); err != nil {
-			fmt.Printf("Failed to serve: %v\n", err)
-		}
-	}()
+	fmt.Printf("Logging-service started on %v...", grpcAddr)
+	if err := grpcServer.Serve(lis); err != nil {
+		fmt.Printf("Failed to serve: %v\n", err)
+	}
 }
 
 func main() {
@@ -112,6 +121,9 @@ func main() {
 	}
 
 	for _, service := range loggingServices {
-		StartNewServer(service)
+		go func(service string) {
+			StartNewServer(service)
+		}(service)
 	}
+	select {}
 }
