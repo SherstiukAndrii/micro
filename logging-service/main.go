@@ -2,58 +2,116 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"sync"
 
+	"github.com/hazelcast/hazelcast-go-client"
 	"google.golang.org/grpc"
 
 	"micro_basics/logging"
 )
 
-type server struct {
-    logging.UnimplementedLoggingServiceServer
-    mu       sync.Mutex
-    messages map[string]string
+type LoggingService struct {
+	logging.UnimplementedLoggingServiceServer
+	mu sync.Mutex
+	hz *hazelcast.Client
 }
 
-func (s *server) SaveMessage(ctx context.Context, req *logging.SaveMessageRequest) (*logging.SaveMessageResponse, error) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+func NewLoggingService(config hazelcast.Config) *LoggingService {
+	ctx := context.TODO()
+	hz, err := hazelcast.StartNewClientWithConfig(ctx, config)
+	if err != nil {
+		panic(err)
+	}
 
-    if _, exists := s.messages[req.Uuid]; exists {
-        fmt.Printf("LoggingService: UUID=%s is already exists \n", req.Uuid)
-        return &logging.SaveMessageResponse{Success: false}, nil
-    }
-
-    s.messages[req.Uuid] = req.Msg
-    fmt.Printf("LoggingService::SaveMessage UUID=%s, msg=%s\n", req.Uuid, req.Msg)
-
-    return &logging.SaveMessageResponse{Success: true}, nil
+	return &LoggingService{
+		hz: hz,
+	}
 }
 
-func (s *server) GetMessages(ctx context.Context, req *logging.GetMessagesRequest) (*logging.GetMessagesResponse, error) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+func (s *LoggingService) SaveMessage(ctx context.Context, req *logging.SaveMessageRequest) (*logging.SaveMessageResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-    var msgs []string
-    for _, msg := range s.messages {
-        msgs = append(msgs, msg)
-    }
+	mapName := "messages"
+	m, err := s.hz.GetMap(ctx, mapName)
+	if err != nil {
+		return nil, err
+	}
 
-    return &logging.GetMessagesResponse{Messages: msgs}, nil
+	if _, err := m.Put(ctx, req.Uuid, req.Msg); err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("LoggingService::SaveMessage UUID=%s, msg=%s\n", req.Uuid, req.Msg)
+
+	return &logging.SaveMessageResponse{Success: true}, nil
+}
+
+func (s *LoggingService) GetMessages(ctx context.Context, req *logging.GetMessagesRequest) (*logging.GetMessagesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	mapName := "messages"
+	m, err := s.hz.GetMap(ctx, mapName)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := m.GetEntrySet(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var msgs []string
+	for _, entry := range entries {
+		msgs = append(msgs, fmt.Sprintf("%s: %s", entry.Key, entry.Value))
+	}
+
+	return &logging.GetMessagesResponse{Messages: msgs}, nil
+}
+
+func StartNewServer(target string) {
+	config := hazelcast.Config{}
+	config.Cluster.Name = "micro"
+	config.Cluster.Network.SetAddresses(target)
+	s := NewLoggingService(config)
+
+	lis, _ := net.Listen("tcp", target)
+	grpcServer := grpc.NewServer()
+
+	logging.RegisterLoggingServiceServer(grpcServer, s)
+	fmt.Printf("Logging-service started on %v...", target)
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			fmt.Printf("Failed to serve: %v\n", err)
+		}
+	}()
 }
 
 func main() {
-    lis, _ := net.Listen("tcp", ":8082")
+	resp, err := http.Get("http://localhost:8081/logging-services")
+	if err != nil {
+		fmt.Printf("failed to get logging services: %v", err)
+	}
+	defer resp.Body.Close()
 
-    grpcServer := grpc.NewServer()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("failed to read response body: %v", err)
+	}
 
-    s := &server{
-        messages: make(map[string]string),
-    }
-    logging.RegisterLoggingServiceServer(grpcServer, s)
-    fmt.Println("Logging-service started on 8082...")
+	var loggingServices []string
+	err = json.Unmarshal(body, &loggingServices)
+	if err != nil {
+		fmt.Printf("failed to unmarshal logging services: %v", err)
+	}
 
-    grpcServer.Serve(lis)
+	for _, service := range loggingServices {
+		StartNewServer(service)
+	}
 }
