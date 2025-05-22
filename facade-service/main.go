@@ -8,65 +8,58 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"micro_basics/common"
 	"micro_basics/logging"
 )
 
 type FacadeService struct {
 	loggingServices []logging.LoggingServiceClient
-	messageServices []string
+	configServerUrl string
+	kafkaProducer   []*kafka.Producer
 }
 
 func NewFacadeService() (*FacadeService, error) {
-	resp, err := http.Get("http://localhost:8081/logging-services")
-	if err != nil {
-		return nil, fmt.Errorf("failed to get logging services: %w", err)
-	}
-	defer resp.Body.Close()
+	configServerPort, _ := os.ReadFile(common.ConfigServerPortPath)
+	configServerUrl := fmt.Sprintf("http://localhost:%s", string(configServerPort))
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
+	resp, _ := http.Get(fmt.Sprintf("%s/logging-services", configServerUrl))
+	body, _ := io.ReadAll(resp.Body)
 
 	var loggingServices []string
-	err = json.Unmarshal(body, &loggingServices)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal logging services: %w", err)
-	}
+	json.Unmarshal(body, &loggingServices)
+	fmt.Printf("Logging services: %v\n", loggingServices)
+	resp.Body.Close()
 
 	logClients := make([]logging.LoggingServiceClient, len(loggingServices))
 	for i, service := range loggingServices {
-		conn, err := grpc.Dial(service, grpc.WithInsecure())
+		conn, err := grpc.Dial(fmt.Sprintf("localhost:%s", service), grpc.WithInsecure())
 		if err != nil {
-			return nil, fmt.Errorf("failed to connect to logging service %s: %w", service, err)
+			log.Fatalf("Failed to connect to logging service: %v", err)
 		}
 		logClients[i] = logging.NewLoggingServiceClient(conn)
 	}
 
-	resp, err = http.Get("http://localhost:8081/messages-services")
-	if err != nil {
-		return nil, fmt.Errorf("failed to get messages services: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var messageServices []string
-	err = json.Unmarshal(body, &messageServices)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal logging services: %w", err)
+	resp, _ = http.Get(fmt.Sprintf("%s/kafka-cluster", configServerUrl))
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var kafkaCluster []string
+	json.Unmarshal(body, &kafkaCluster)
+	kafkaProducers := make([]*kafka.Producer, len(kafkaCluster))
+	for i, node := range kafkaCluster {
+		producer, _ := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": fmt.Sprintf("localhost:%s", node)})
+		kafkaProducers[i] = producer
 	}
 
-	return &FacadeService{loggingServices: logClients, messageServices: messageServices}, nil
+	return &FacadeService{loggingServices: logClients, configServerUrl: configServerUrl, kafkaProducer: kafkaProducers}, nil
 }
 
 func (fs *FacadeService) getLoggingService() logging.LoggingServiceClient {
@@ -74,7 +67,14 @@ func (fs *FacadeService) getLoggingService() logging.LoggingServiceClient {
 }
 
 func (fs *FacadeService) getMessageService() string {
-	return fs.messageServices[rand.Intn(len(fs.messageServices))]
+	resp, _ := http.Get(fmt.Sprintf("%s/message-services", fs.configServerUrl))
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var messageServices []string
+	json.Unmarshal(body, &messageServices)
+
+	return messageServices[rand.Intn(len(messageServices))]
 }
 
 func (fs *FacadeService) getHandler(w http.ResponseWriter, r *http.Request) {
@@ -83,11 +83,11 @@ func (fs *FacadeService) getHandler(w http.ResponseWriter, r *http.Request) {
 	res, _ := logClient.GetMessages(context.Background(), &logging.GetMessagesRequest{})
 
 	message := fs.getMessageService()
-	resp, _ := http.Get(fmt.Sprintf("%s/message", message))
-	messageServiceText := ""
+	resp, _ := http.Get(fmt.Sprintf("http://localhost:%s/message", message))
 	body, _ := io.ReadAll(resp.Body)
+	var messageServiceText []string
+	json.Unmarshal(body, &messageServiceText)
 	resp.Body.Close()
-	messageServiceText = string(body)
 
 	final := fmt.Sprintf(
 		"Messages-service answer: %s\nLogging-service all messages: %v\n",
@@ -114,7 +114,20 @@ func (fs *FacadeService) postHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintf(w, "New message: UUID=%s\n", id)
+	producer := fs.kafkaProducer[rand.Intn(len(fs.kafkaProducer))]
+	topic := "test-topic2"
+	err := producer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+		Value:          []byte(msg),
+	}, nil)
+	if err != nil {
+		http.Error(w, "Failed to send message to Kafka", http.StatusInternalServerError)
+		return
+	}
+	// producer.Flush(15000)
+	log.Printf("Message \"%s\" sent to Kafka %s\n", msg, producer)
+
+	fmt.Fprintf(w, "New message \"%s\": UUID=%s\n", msg, id)
 }
 
 func sendMessageWithRetry(client logging.LoggingServiceClient, uuid string, msg string, maxRetries int, retryDelay time.Duration) bool {
@@ -146,17 +159,16 @@ func sendMessageWithRetry(client logging.LoggingServiceClient, uuid string, msg 
 	return false
 }
 
-var facade FacadeService
-
 func main() {
-	facadeService, err := NewFacadeService()
-	if err != nil {
-		log.Fatalf("Failed to create FacadeService: %v", err)
-	}
+	facadeService, _ := NewFacadeService()
 
 	http.HandleFunc("/get", facadeService.getHandler)
 	http.HandleFunc("/post", facadeService.postHandler)
 
-	fmt.Println("Facade-service started on 8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	resp, _ := http.Get(fmt.Sprintf("%s/free", facadeService.configServerUrl))
+	port, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	fmt.Printf("Facade-service started on %v...\n", string(port))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%v", string(port)), nil))
 }

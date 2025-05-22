@@ -1,17 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"github.com/hazelcast/hazelcast-go-client"
 	"google.golang.org/grpc"
 
+	"micro_basics/common"
 	"micro_basics/logging"
 )
 
@@ -28,9 +34,7 @@ func NewLoggingService(config hazelcast.Config) *LoggingService {
 		panic(err)
 	}
 
-	return &LoggingService{
-		hz: hz,
-	}
+	return &LoggingService{hz: hz}
 }
 
 func (s *LoggingService) SaveMessage(ctx context.Context, req *logging.SaveMessageRequest) (*logging.SaveMessageResponse, error) {
@@ -75,43 +79,69 @@ func (s *LoggingService) GetMessages(ctx context.Context, req *logging.GetMessag
 	return &logging.GetMessagesResponse{Messages: msgs}, nil
 }
 
-func StartNewServer(target string) {
+func StartNewServer(ctx context.Context, wg *sync.WaitGroup, hazelcastNode string, port string) {
+	wg.Add(1)
+
 	config := hazelcast.Config{}
 	config.Cluster.Name = "micro"
-	config.Cluster.Network.SetAddresses(target)
+	config.Cluster.Network.SetAddresses(fmt.Sprintf("127.0.0.1:%s", hazelcastNode))
+
 	s := NewLoggingService(config)
 
-	lis, _ := net.Listen("tcp", target)
-	grpcServer := grpc.NewServer()
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
+	if err != nil {
+		log.Fatalf("failed to listen on port %s: %v", port, err)
+	}
 
+	grpcServer := grpc.NewServer()
 	logging.RegisterLoggingServiceServer(grpcServer, s)
-	fmt.Printf("Logging-service started on %v...", target)
+
 	go func() {
+		defer wg.Done()
+		log.Printf("gRPC server started on port %s\n", port)
+
+		go func() {
+			<-ctx.Done()
+			log.Printf("shutting down gRPC server on port %s...\n", port)
+			grpcServer.GracefulStop()
+		}()
+
 		if err := grpcServer.Serve(lis); err != nil {
-			fmt.Printf("Failed to serve: %v\n", err)
+			log.Printf("gRPC server on port %s stopped: %v\n", port, err)
 		}
 	}()
 }
 
 func main() {
-	resp, err := http.Get("http://localhost:8081/logging-services")
-	if err != nil {
-		fmt.Printf("failed to get logging services: %v", err)
-	}
-	defer resp.Body.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("failed to read response body: %v", err)
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	configServerPort, _ := os.ReadFile(common.ConfigServerPortPath)
+	configServerUrl := fmt.Sprintf("http://localhost:%s", string(configServerPort))
+
+	resp, _ := http.Get(fmt.Sprintf("%s/hazelcast-cluster", configServerUrl))
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var hazelcastCluster []string
+	json.Unmarshal(body, &hazelcastCluster)
+
+	for _, hazelcastNode := range hazelcastCluster {
+		resp, _ := http.Get(fmt.Sprintf("%s/free", configServerUrl))
+		port, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		StartNewServer(ctx, wg, hazelcastNode, string(port))
+		http.Post(fmt.Sprintf("%s/add-logging-service", configServerUrl), "text/plain", bytes.NewBufferString(string(port)))
 	}
 
-	var loggingServices []string
-	err = json.Unmarshal(body, &loggingServices)
-	if err != nil {
-		fmt.Printf("failed to unmarshal logging services: %v", err)
-	}
+	<-sigs
+	log.Println("Termination signal received")
+	cancel()
 
-	for _, service := range loggingServices {
-		StartNewServer(service)
-	}
+	wg.Wait()
+	log.Println("All services stopped cleanly")
 }
