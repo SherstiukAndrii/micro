@@ -1,21 +1,20 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"micro_basics/common"
 	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
+
+	utils "micro_basics/common"
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/hashicorp/consul/api"
 )
 
 type MessageService struct {
@@ -52,7 +51,7 @@ func (s *MessageService) messageHandler(w http.ResponseWriter, r *http.Request) 
 	w.Write(response)
 }
 
-func StartNewServer(ctx context.Context, wg *sync.WaitGroup, kafkaNode string, port string) {
+func StartNewServer(ctx context.Context, wg *sync.WaitGroup, kafkaNode string, consulClient *api.Client) {
 	wg.Add(1)
 
 	config := kafka.ConfigMap{
@@ -65,24 +64,44 @@ func StartNewServer(ctx context.Context, wg *sync.WaitGroup, kafkaNode string, p
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/message", s.messageHandler)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
 
+	port := utils.GetFreePort()
 	httpServer := &http.Server{
-		Addr:    fmt.Sprintf(":%s", port),
+		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
 	}
 
+	serviceID := fmt.Sprintf("message-service:%d", port)
+	reg := &api.AgentServiceRegistration{
+		ID:      serviceID,
+		Name:    "message-service",
+		Address: "127.0.0.1",
+		Port:    port,
+		Check: &api.AgentServiceCheck{
+			HTTP:     fmt.Sprintf("http://127.0.0.1:%d/health", port),
+			Interval: "10s",
+			Timeout:  "1s",
+		},
+	}
+	consulClient.Agent().ServiceRegister(reg)
+
 	go func() {
 		defer wg.Done()
-		log.Printf("Starting server on port %s", port)
+		log.Printf("Starting server on port %d", port)
 
 		go func() {
 			<-ctx.Done()
-			log.Printf("Shutting down server on port %s", port)
+			log.Printf("Shutting down server on port %d", port)
+			consulClient.Agent().ServiceDeregister(serviceID)
 			httpServer.Shutdown(context.Background())
 		}()
 
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Server error on port %s: %v", port, err)
+			log.Printf("Server error on port %d: %v", port, err)
 		}
 	}()
 }
@@ -94,27 +113,20 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-	configServerPort, _ := os.ReadFile(common.ConfigServerPortPath)
-	configServerUrl := fmt.Sprintf("http://localhost:%s", string(configServerPort))
+	consulClient, _ := api.NewClient(api.DefaultConfig())
 
-	resp, _ := http.Get(fmt.Sprintf("%s/kafka-cluster", configServerUrl))
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	kv := consulClient.KV()
+	pair, _, _ := kv.Get("config", nil)
 
-	var kafkaCluster []string
-	json.Unmarshal(body, &kafkaCluster)
+	var config map[string][]string
+	json.Unmarshal(pair.Value, &config)
+	kafkaCluster := config["kafka-cluster"]
 
 	for i, kafkaNode := range kafkaCluster {
 		if i > 1 {
 			break
 		}
-		resp, _ := http.Get(fmt.Sprintf("%s/free", configServerUrl))
-		port, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		StartNewServer(ctx, wg, kafkaNode, string(port))
-		http.Post(fmt.Sprintf("%s/add-message-service", configServerUrl), "text/plain", bytes.NewBufferString(string(port)))
-		time.Sleep(5 * time.Second)
+		StartNewServer(ctx, wg, kafkaNode, consulClient)
 	}
 
 	<-sigs

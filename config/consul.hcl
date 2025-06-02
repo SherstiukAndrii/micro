@@ -1,0 +1,9 @@
+node_name = "micro-server"
+datacenter = "dc1"
+data_dir = "/opt/consul"
+log_level = "INFO"
+server = true
+bootstrap_expect = 1
+bind_addr = "172.18.4.74"
+client_addr = "0.0.0.0"
+ui = true

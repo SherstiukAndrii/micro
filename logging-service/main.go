@@ -1,23 +1,25 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
+	utils "micro_basics/common"
+
+	"github.com/hashicorp/consul/api"
 	"github.com/hazelcast/hazelcast-go-client"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
-	"micro_basics/common"
 	"micro_basics/logging"
 )
 
@@ -79,7 +81,7 @@ func (s *LoggingService) GetMessages(ctx context.Context, req *logging.GetMessag
 	return &logging.GetMessagesResponse{Messages: msgs}, nil
 }
 
-func StartNewServer(ctx context.Context, wg *sync.WaitGroup, hazelcastNode string, port string) {
+func StartNewServer(ctx context.Context, wg *sync.WaitGroup, hazelcastNode string, consulClient *api.Client) {
 	wg.Add(1)
 
 	config := hazelcast.Config{}
@@ -88,26 +90,46 @@ func StartNewServer(ctx context.Context, wg *sync.WaitGroup, hazelcastNode strin
 
 	s := NewLoggingService(config)
 
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
+	port := utils.GetFreePort()
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Fatalf("failed to listen on port %s: %v", port, err)
+		log.Fatalf("failed to listen on port %d: %v", port, err)
 	}
 
 	grpcServer := grpc.NewServer()
 	logging.RegisterLoggingServiceServer(grpcServer, s)
 
+	healthServer := health.NewServer()
+	healthServer.SetServingStatus("logging.LoggingService", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(grpcServer, healthServer)
+
+	serviceID := fmt.Sprintf("logging-service:%d", port)
+	reg := &api.AgentServiceRegistration{
+		ID:      serviceID,
+		Name:    "logging-service",
+		Address: "127.0.0.1",
+		Port:    port,
+		Check: &api.AgentServiceCheck{
+			GRPC:     fmt.Sprintf("127.0.0.1:%d", port),
+			Interval: "10s",
+			Timeout:  "1s",
+		},
+	}
+	consulClient.Agent().ServiceRegister(reg)
+
 	go func() {
 		defer wg.Done()
-		log.Printf("gRPC server started on port %s\n", port)
+		log.Printf("gRPC server started on port %d\n", port)
 
 		go func() {
 			<-ctx.Done()
-			log.Printf("shutting down gRPC server on port %s...\n", port)
+			log.Printf("shutting down gRPC server on port %d...\n", port)
+			consulClient.Agent().ServiceDeregister(serviceID)
 			grpcServer.GracefulStop()
 		}()
 
 		if err := grpcServer.Serve(lis); err != nil {
-			log.Printf("gRPC server on port %s stopped: %v\n", port, err)
+			log.Printf("gRPC server on port %d stopped: %v\n", port, err)
 		}
 	}()
 }
@@ -119,23 +141,29 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-	configServerPort, _ := os.ReadFile(common.ConfigServerPortPath)
-	configServerUrl := fmt.Sprintf("http://localhost:%s", string(configServerPort))
+	consulClient, _ := api.NewClient(api.DefaultConfig())
 
-	resp, _ := http.Get(fmt.Sprintf("%s/hazelcast-cluster", configServerUrl))
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	kv := consulClient.KV()
+	pair, _, _ := kv.Get("config", nil)
 
-	var hazelcastCluster []string
-	json.Unmarshal(body, &hazelcastCluster)
+	var config map[string][]string
+	json.Unmarshal(pair.Value, &config)
+	hazelcastCluster := config["hazelcast-cluster"]
 
-	for _, hazelcastNode := range hazelcastCluster {
-		resp, _ := http.Get(fmt.Sprintf("%s/free", configServerUrl))
-		port, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+	for i, hazelcastNode := range hazelcastCluster {
+		// Finish the second instance after 30 seconds
+		if i == 1 {
+			secondCtx, secondCancel := context.WithCancel(ctx)
+			go StartNewServer(secondCtx, wg, hazelcastNode, consulClient)
 
-		StartNewServer(ctx, wg, hazelcastNode, string(port))
-		http.Post(fmt.Sprintf("%s/add-logging-service", configServerUrl), "text/plain", bytes.NewBufferString(string(port)))
+			go func() {
+				<-time.After(30 * time.Second)
+				log.Println("Stopping second instance manually after 30 seconds")
+				secondCancel()
+			}()
+		} else {
+			go StartNewServer(ctx, wg, hazelcastNode, consulClient)
+		}
 	}
 
 	<-sigs
